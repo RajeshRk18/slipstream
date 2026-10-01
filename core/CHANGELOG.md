@@ -10,6 +10,8 @@ workspace.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-01
+
 ### Added
 - `events`: `DownloadFailure`, `DOWNLOAD_FAILURE_STALL_STREAK`, `DOWNLOAD_FAILURE_RUN_GAP_SECS`,
   and the `Progress` methods `note_download_gave_up`, `note_blocks_released`,
