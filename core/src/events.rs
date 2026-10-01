@@ -79,7 +79,7 @@ pub struct DownloadFailure {
 ///
 /// Wrap in `Arc<Progress>` and pass `Some(arc)` to `engine::sync_once` to
 /// receive live updates. `None` disables all progress tracking with zero overhead.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Progress {
     /// Current chain tip height as reported by the server.
     pub chain_tip: AtomicU64,
@@ -124,11 +124,41 @@ pub struct Progress {
     /// time the block download has kept failing at the same block — see [`Self::stall_secs`].
     pub last_progress_unix: AtomicU64,
     /// Session-monotonic progress floor in permille (0..=1000). The snapshot fetch-maxes
-    /// the raw `scanned / pass_total` ratio into this and reports the floor, so reported
-    /// progress NEVER regresses while the handle lives (subsumes the SDK's
-    /// monotonicRecoveryProgress floor and its warm-start seeding: a follow-up catch-up
-    /// pass holds the prior high-water mark instead of flashing back to 0%).
+    /// the pass's BLENDED progress into this and reports the floor, so reported progress
+    /// NEVER regresses while the handle lives (subsumes the SDK's monotonicRecoveryProgress
+    /// floor and its warm-start seeding: a follow-up catch-up pass holds the prior
+    /// high-water mark instead of flashing back to 0%). The blend stretches the pass-local
+    /// ratio of fetched+scanned blocks between the pass's starting GLOBAL position (see
+    /// [`Progress::pass_start_permille`]) and 1000, instead of the raw `scanned / pass_total`
+    /// ratio this field used to be fed directly.
     pub progress_permille_floor: AtomicU64,
+    /// The pass's starting GLOBAL position in permille — the `global_floor_permille` seed
+    /// recorded by the FIRST suggest round of the current pass (see
+    /// [`Self::set_pass_start_permille_if_unset`]), or overwritten mid-pass when the scan
+    /// scope expands under it (see [`Self::set_pass_start_permille`] and
+    /// [`Self::rebaseline_floor_if_scope_expanded`]). `u64::MAX` means unset — no suggest
+    /// round has recorded one yet this pass (see [`Self::begin_pass`], which resets it).
+    /// The FFI snapshot stretches the pass-local fetched+scanned ratio between this value
+    /// and 1000 (`raw = start + (1000 − start) × pass_permille / 1000`), so a resync's
+    /// reading climbs from where the wallet's GLOBAL position already stood instead of
+    /// restarting at 0 and staying invisible until the pass-local ratio alone crosses that
+    /// same global position. Read with [`Self::pass_start_permille`].
+    pass_start_permille: AtomicU64,
+    /// [h16-1] `fetched_blocks`/`scanned_blocks` value (respectively) that the pass-local
+    /// blend's numerators are measured FROM, snapshotted by the scheduler every suggest
+    /// round (see [`Self::set_pass_baseline`]) just before it sets `pass_total_blocks`. The
+    /// FFI snapshot's `pass_permille` term uses `fetched() − pass_base_fetched()` (clamped
+    /// to `pass_total`) in place of the raw counter, so blocks this pass already credited to
+    /// `scanned_so_far_in_pass` before the snapshot — e.g. the ones folded into a scope
+    /// expansion's re-baselined `pass_start_permille` — are not counted a SECOND time
+    /// against the new total. `fetched_blocks`/`scanned_blocks` themselves are never zeroed
+    /// mid-pass (other readers need the raw counters: the FFI snapshot's own
+    /// `fetched_blocks`/`scanned_blocks` fields, and the CLI ticker), so this baseline is
+    /// the offset, not a reset. Reset to 0 by [`Self::begin_pass`]. Read with
+    /// [`Self::pass_base_fetched`] / [`Self::pass_base_scanned`].
+    pass_base_fetched: AtomicU64,
+    /// [h16-1] See [`Self::pass_base_fetched`] — the `scanned_blocks` counterpart.
+    pass_base_scanned: AtomicU64,
     /// [API v2.1 E-2/E-3] Count of successful `update_chain_tip` persists across the handle's
     /// life. Bumped by the ENGINE only (never by the E-3 open-time seed, which stores a
     /// persisted tip VALUE without proving freshness) — the FFI's `tip_fresh` fact latches
@@ -169,6 +199,38 @@ pub struct Progress {
     /// give-up, spent by [`Self::note_attempt_failed`], and cleared by
     /// [`Self::note_pass_completed`] and [`Self::begin_session`].
     download_gave_up_this_attempt: AtomicBool,
+}
+
+impl Default for Progress {
+    /// Every counter starts at 0 — the natural "nothing has happened yet" value — except
+    /// `pass_start_permille`: 0 there is a legitimate pass-start position (a fresh-birthday
+    /// restore has a GLOBAL position of 0‰), so it cannot double as the "unset" sentinel and
+    /// starts at `u64::MAX` instead (see the field's own doc and
+    /// [`Progress::pass_start_permille`]).
+    fn default() -> Self {
+        Self {
+            chain_tip: AtomicU64::new(0),
+            fetched_blocks: AtomicU64::new(0),
+            scanned_blocks: AtomicU64::new(0),
+            enhanced_txs: AtomicU64::new(0),
+            current_range_end: AtomicU64::new(0),
+            reorgs_recovered: AtomicU64::new(0),
+            pass_total_blocks: AtomicU64::new(0),
+            spendable_hint: AtomicU64::new(0),
+            ranges_completed: AtomicU64::new(0),
+            recovering: AtomicU64::new(0),
+            last_progress_unix: AtomicU64::new(0),
+            progress_permille_floor: AtomicU64::new(0),
+            pass_start_permille: AtomicU64::new(u64::MAX),
+            pass_base_fetched: AtomicU64::new(0),
+            pass_base_scanned: AtomicU64::new(0),
+            tip_refreshes: AtomicU64::new(0),
+            tx_set_version: AtomicU64::new(0),
+            wallet_writers: AtomicUsize::new(0),
+            download_failures: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            download_gave_up_this_attempt: AtomicBool::new(false),
+        }
+    }
 }
 
 /// [API v2.1 E-5] Scope-expansion detection margin for the session progress floor: a
@@ -550,6 +612,20 @@ impl Progress {
         self.progress_permille_floor.load(Ordering::Relaxed)
     }
 
+    /// [h17-1] Pure read of the scope-expansion condition: true when `seed` lands materially
+    /// BELOW the current session floor (see [`Self::rebaseline_floor_if_scope_expanded`]'s doc
+    /// for what that means and why). Stores nothing — [`Self::rebaseline_floor_if_scope_expanded`]
+    /// checks exactly this same condition (it calls this method) before it stores. Lets a
+    /// caller decide which branch to take, and publish every field a re-baseline touches in a
+    /// safe order, before the floor itself moves — see `update_pass_progress`
+    /// (`core/src/scheduler.rs`), which calls this first and calls
+    /// [`Self::rebaseline_floor_if_scope_expanded`] last for exactly that reason.
+    #[inline]
+    pub fn scope_expanded(&self, seed: u64) -> bool {
+        let current = self.progress_permille_floor.load(Ordering::Relaxed);
+        seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current
+    }
+
     /// [API v2.1 E-5] When a suggest round's GLOBAL seed lands materially BELOW the current
     /// session floor, the scan SCOPE EXPANDED under the floor's feet — an imported account
     /// with an older birthday, or a rewind re-growing the queue — and the old floor (folded
@@ -560,8 +636,7 @@ impl Progress {
     /// epsilon is 50× above that noise and far below any real expansion (an import drops
     /// the seed by hundreds of permille). Returns whether a re-baseline happened.
     pub fn rebaseline_floor_if_scope_expanded(&self, seed: u64) -> bool {
-        let current = self.progress_permille_floor.load(Ordering::Relaxed);
-        if seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current {
+        if self.scope_expanded(seed) {
             self.progress_permille_floor
                 .store(seed.min(1000), Ordering::Relaxed);
             return true;
@@ -569,17 +644,84 @@ impl Progress {
         false
     }
 
+    /// The pass's starting GLOBAL position in permille, as recorded by
+    /// [`Self::set_pass_start_permille_if_unset`] or [`Self::set_pass_start_permille`].
+    /// `None` before any suggest round of the current pass has recorded one — `begin_pass`
+    /// leaves it this way. See the `pass_start_permille` field doc for how the FFI snapshot
+    /// uses it.
+    #[inline]
+    pub fn pass_start_permille(&self) -> Option<u64> {
+        let v = self.pass_start_permille.load(Ordering::Relaxed);
+        if v == u64::MAX { None } else { Some(v) }
+    }
+
+    /// Record `seed` as the pass start IF no suggest round of the current pass has recorded
+    /// one yet (compare-exchange against the unset sentinel). Called on every suggest round;
+    /// only the FIRST round of a pass has any effect — later rounds of the SAME pass keep the
+    /// value the first round saw, so the pass's reported progress is always measured from
+    /// where the wallet's global position stood when the pass began, not wherever a later
+    /// round's seed has since drifted to. Clamps to 1000, matching [`Self::permille_floor`]'s
+    /// own clamp (`u64::MAX` is reserved for "unset" and can never be recorded as a value).
+    #[inline]
+    pub fn set_pass_start_permille_if_unset(&self, seed: u64) {
+        let seed = seed.min(1000);
+        let _ = self.pass_start_permille.compare_exchange(
+            u64::MAX,
+            seed,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Overwrite the pass start with `seed` unconditionally. Called instead of
+    /// [`Self::set_pass_start_permille_if_unset`] when
+    /// [`Self::rebaseline_floor_if_scope_expanded`] reports that the scan scope grew under
+    /// the running pass (an imported account with an older birthday, or a rewind): the
+    /// pass's own progress must stretch from the RE-BASELINED position, or the blend would
+    /// still stretch from the stale pre-expansion start and under-report the re-scan's climb.
+    /// Clamps to 1000, matching [`Self::permille_floor`]'s own clamp.
+    #[inline]
+    pub fn set_pass_start_permille(&self, seed: u64) {
+        self.pass_start_permille
+            .store(seed.min(1000), Ordering::Relaxed);
+    }
+
+    /// [h16-1] Snapshot the pass-local blend baseline: `fetched`/`scanned` reads that the
+    /// FFI snapshot's `pass_permille` term measures FROM (see the `pass_base_fetched` field
+    /// doc). Called by the scheduler on every suggest round, and again — to different
+    /// values — when a scope expansion re-baselines the session floor.
+    #[inline]
+    pub fn set_pass_baseline(&self, fetched: u64, scanned: u64) {
+        self.pass_base_fetched.store(fetched, Ordering::Relaxed);
+        self.pass_base_scanned.store(scanned, Ordering::Relaxed);
+    }
+
+    /// Read the pass-local fetched baseline (see [`Self::set_pass_baseline`]).
+    #[inline]
+    pub fn pass_base_fetched(&self) -> u64 {
+        self.pass_base_fetched.load(Ordering::Relaxed)
+    }
+
+    /// Read the pass-local scanned baseline (see [`Self::set_pass_baseline`]).
+    #[inline]
+    pub fn pass_base_scanned(&self) -> u64 {
+        self.pass_base_scanned.load(Ordering::Relaxed)
+    }
+
     /// Reset the per-pass RATIO counters at the start of a sync pass.
     ///
     /// The FFI handle outlives individual sync passes (Swift `prepare()` opens it once;
     /// `stop()`/`start()` reuse it across app background/foreground cycles), so without
-    /// this reset a resumed pass would compute `scanned / pass_total` with a stale
-    /// numerator from the previous pass — e.g. 100k stale scanned / 169k remaining
-    /// = 59% at pass start, climbing past 100% (clamped) long before the pass is done.
+    /// this reset a resumed pass would compute its progress blend with a stale numerator
+    /// from the previous pass — e.g. 100k stale scanned / 169k remaining = 59% at pass
+    /// start, climbing past 100% (clamped) long before the pass is done.
     ///
     /// Resets: `scanned_blocks`, `fetched_blocks`, `pass_total_blocks`,
-    /// `current_range_end`, and the `spendable_hint` latch (the new pass's ChainTip
-    /// range re-latches it within seconds, mirroring old-SDK per-sync semantics).
+    /// `current_range_end`, the `spendable_hint` latch (the new pass's ChainTip
+    /// range re-latches it within seconds, mirroring old-SDK per-sync semantics),
+    /// `pass_start_permille` (back to unset — the new pass has not had a suggest round
+    /// yet; see [`Self::pass_start_permille`]), and the `pass_base_fetched`/
+    /// `pass_base_scanned` blend baseline (back to 0 — see [`Self::set_pass_baseline`]).
     ///
     /// Deliberately NOT reset (monotonic per handle — Swift consumes these as deltas
     /// via strict-greater/last-seen comparisons): `enhanced_txs`, `ranges_completed`,
@@ -590,6 +732,9 @@ impl Progress {
         self.pass_total_blocks.store(0, Ordering::Relaxed);
         self.current_range_end.store(0, Ordering::Relaxed);
         self.spendable_hint.store(0, Ordering::Relaxed);
+        self.pass_start_permille.store(u64::MAX, Ordering::Relaxed);
+        self.pass_base_fetched.store(0, Ordering::Relaxed);
+        self.pass_base_scanned.store(0, Ordering::Relaxed);
         // v2: a new pass starts the stall clock fresh. `recovering` and the permille
         // floor are deliberately NOT reset — recovering is recomputed on the first
         // suggest round, and the floor is session-monotonic by contract (§4.4).
@@ -989,6 +1134,36 @@ mod tests {
         );
     }
 
+    /// [h16-1] The pass-local blend baseline defaults to 0, round-trips through its setter,
+    /// and — like the other per-pass ratio state — resets to 0 on `begin_pass()`.
+    #[test]
+    fn pass_baseline_defaults_to_zero_and_resets_on_begin_pass() {
+        let p = Progress::default();
+        assert_eq!(p.pass_base_fetched(), 0, "unset on a fresh handle");
+        assert_eq!(p.pass_base_scanned(), 0, "unset on a fresh handle");
+
+        p.set_pass_baseline(12_345, 6_789);
+        assert_eq!(p.pass_base_fetched(), 12_345);
+        assert_eq!(p.pass_base_scanned(), 6_789);
+
+        // A later suggest round re-snapshots to different values (store, not add).
+        p.set_pass_baseline(1, 2);
+        assert_eq!(
+            p.pass_base_fetched(),
+            1,
+            "set_pass_baseline overwrites, not adds"
+        );
+        assert_eq!(
+            p.pass_base_scanned(),
+            2,
+            "set_pass_baseline overwrites, not adds"
+        );
+
+        p.begin_pass();
+        assert_eq!(p.pass_base_fetched(), 0, "begin_pass resets the baseline");
+        assert_eq!(p.pass_base_scanned(), 0, "begin_pass resets the baseline");
+    }
+
     /// [API v2.1 E-5] The floor re-baselines when the scope EXPANDS (seed materially below
     /// the floor — import/rewind) and stays monotone against within-scope noise.
     #[test]
@@ -1017,6 +1192,114 @@ mod tests {
         );
         // …and climbs monotonically again within the new scope.
         assert_eq!(p.permille_floor(300), 300);
+    }
+
+    /// [h17-1] `scope_expanded` answers exactly like its mutating sibling
+    /// `rebaseline_floor_if_scope_expanded` on the same inputs, but never writes: the floor
+    /// must hold across both a within-scope "false" reading and a genuine-expansion "true"
+    /// one, and only the mutating call may then move it.
+    #[test]
+    fn scope_expanded_reads_true_and_false_without_mutating_the_floor() {
+        let p = Progress::default();
+        assert_eq!(p.permille_floor(900), 900);
+
+        // Within-scope noise reads false, and a pure read must not move the floor.
+        assert!(
+            !p.scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE),
+            "exactly-epsilon dip is still within scope"
+        );
+        assert_eq!(
+            p.permille_floor(0),
+            900,
+            "a pure read must not lower the floor"
+        );
+
+        // A material drop reads true — and is STILL just a read: the floor holds until a
+        // caller separately chooses to act on it.
+        assert!(
+            p.scope_expanded(450),
+            "450 is >50‰ below the 900 floor ⇒ scope expansion"
+        );
+        assert_eq!(
+            p.permille_floor(0),
+            900,
+            "scope_expanded alone must never lower (or raise) the floor"
+        );
+
+        // Agrees with the mutating sibling on both the false and the true case.
+        assert!(!p.rebaseline_floor_if_scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE));
+        assert_eq!(
+            p.permille_floor(0),
+            900,
+            "still not expanded ⇒ still untouched"
+        );
+        assert!(p.rebaseline_floor_if_scope_expanded(450));
+        assert_eq!(
+            p.permille_floor(0),
+            450,
+            "the mutating sibling now re-baselines"
+        );
+    }
+
+    /// [h10] The pass start records the FIRST suggest round's seed and holds through later
+    /// rounds of the same pass; `begin_pass()` unsets it for the next pass; a scope-expansion
+    /// re-baseline (import/rewind) overwrites it instead of holding the stale pre-expansion
+    /// value. Mirrors exactly the branch the scheduler's suggest-round loop takes.
+    #[test]
+    fn pass_start_permille_records_once_then_rebaselines_on_scope_expansion() {
+        let p = Progress::default();
+        assert_eq!(
+            p.pass_start_permille(),
+            None,
+            "unset on a fresh handle (default sentinel)"
+        );
+
+        // First suggest round of the pass: ordinary progress, no scope expansion.
+        assert!(!p.rebaseline_floor_if_scope_expanded(300));
+        p.set_pass_start_permille_if_unset(300);
+        let _ = p.permille_floor(300);
+        assert_eq!(p.pass_start_permille(), Some(300));
+
+        // A later round of the SAME pass, still no expansion — the start must hold.
+        assert!(!p.rebaseline_floor_if_scope_expanded(340));
+        p.set_pass_start_permille_if_unset(340);
+        let _ = p.permille_floor(340);
+        assert_eq!(
+            p.pass_start_permille(),
+            Some(300),
+            "later rounds of the same pass keep the first value"
+        );
+
+        // A round where the scope EXPANDS under the pass (an import with an older
+        // birthday, or a rewind): the pass start must follow the re-baseline.
+        assert!(p.rebaseline_floor_if_scope_expanded(50));
+        p.set_pass_start_permille(50);
+        assert_eq!(
+            p.pass_start_permille(),
+            Some(50),
+            "scope expansion overwrites the pass start"
+        );
+
+        // begin_pass() (the next pass) unsets it again.
+        p.begin_pass();
+        assert_eq!(p.pass_start_permille(), None, "begin_pass unsets the start");
+
+        // The new pass's first round records fresh.
+        p.set_pass_start_permille_if_unset(10);
+        assert_eq!(p.pass_start_permille(), Some(10));
+    }
+
+    /// [h10] Both setters clamp to 1000, matching `permille_floor`'s own clamp — a seed can
+    /// never express more than "fully caught up".
+    #[test]
+    fn pass_start_permille_setters_clamp_to_1000() {
+        let p = Progress::default();
+        p.set_pass_start_permille(5_000);
+        assert_eq!(p.pass_start_permille(), Some(1000));
+
+        let p2 = Progress::default();
+        p2.set_pass_start_permille_if_unset(5_000);
+        assert_eq!(p2.pass_start_permille(), Some(1000));
     }
 
     // ── download-failure runs (the repeated-give-up stall span) ──────────────────
