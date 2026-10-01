@@ -43,6 +43,8 @@ workspace.
 - `grpc::get_subtree_roots`, `grpc::get_taddress_txids`, `grpc::get_address_utxos` and
   `transparent::refresh_utxos` take a new `progress: Option<&Progress>` argument, stamped for
   every message received.
+- `grpc::SubtreeRoots` is `#[non_exhaustive]`, so a field for a future pool is not a breaking
+  change.
 
 ### Fixed
 - A fetch whose plan chunk exhausts its retry budget now fails the pass immediately, so the

@@ -258,6 +258,9 @@ pub async fn get_tree_state(
 }
 
 /// Collected subtree roots for all three pools (Sapling, Orchard, Ironwood).
+///
+/// Non-exhaustive so that a field for a future pool is not a breaking change.
+#[non_exhaustive]
 pub struct SubtreeRoots {
     pub sapling: Vec<CommitmentTreeRoot<sapling::Node>>,
     pub orchard: Vec<CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>>,
