@@ -10,12 +10,20 @@ workspace.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-01
+
 ### Added
 - `events`: `DownloadFailure`, `DOWNLOAD_FAILURE_STALL_STREAK`, `DOWNLOAD_FAILURE_RUN_GAP_SECS`,
   and the `Progress` methods `note_download_gave_up`, `note_blocks_released`,
   `note_pass_completed`, `begin_session`, `note_attempt_failed`, `download_failures`,
   `download_failure_secs` and `stall_secs`. They track, per block, a block download that keeps
   giving up, and derive from it the stall fact the snapshot reports as `stalled_seconds`.
+- `grpc::SubtreeRoots::ironwood`, the server's Ironwood subtree roots, alongside `sapling` and
+  `orchard`.
+- `events`: the `Progress` methods `pass_start_permille`, `set_pass_start_permille`,
+  `set_pass_start_permille_if_unset`, `scope_expanded`, `set_pass_baseline`, `pass_base_fetched`
+  and `pass_base_scanned`. They record where a pass started, and the blocks it had fetched and
+  scanned when the current suggest round began, which `progress_permille` measures from.
 
 ### Changed
 - `stalled_seconds` (and `Progress::last_progress_unix`) now also move whenever data arrives from
@@ -41,6 +49,15 @@ workspace.
 - `grpc::get_subtree_roots`, `grpc::get_taddress_txids`, `grpc::get_address_utxos` and
   `transparent::refresh_utxos` take a new `progress: Option<&Progress>` argument, stamped for
   every message received.
+- `grpc::SubtreeRoots` is `#[non_exhaustive]`, so a field for a future pool is not a breaking
+  change.
+- `progress_permille` climbs through a pass instead of holding at the session floor until the
+  pass is nearly scanned. It maps the pass's downloaded and scanned blocks, at half weight each,
+  into the gap between the position the pass started from and done. A scan-scope expansion (an
+  import with an older birthday) re-bases it, a continuity repair counts only the blocks below
+  its rewind height, and the wallet birthday is read again every suggest round. The session
+  floor and `Done` reading 1000 are unchanged.
+- `engine::ENGINE_BUILD` is `2026-09-24.v0.12-download-failure-stall`.
 
 ### Fixed
 - A fetch whose plan chunk exhausts its retry budget now fails the pass immediately, so the
@@ -52,6 +69,11 @@ workspace.
   the stream continues. When a stream errors, goes silent, or ends early, the blocks it already
   delivered are handed on before the attempt is retried, so the retry resumes after them instead
   of downloading them again.
+- Ironwood subtree roots are fetched from the server every pass and grafted like Sapling's and
+  Orchard's, so Ironwood's shard indices stay a complete range. Previously they were only
+  seeded locally: when one account's Ironwood tree was seeded near the tip before another
+  account's older-birthday scan crossed Ironwood activation, the scan failed with
+  `SubtreeDiscontinuity` and the sync retried forever.
 
 ## [0.2.0] - 2026-08-19
 
