@@ -1942,6 +1942,7 @@ mod tests {
         >(
             db,
             &zcash_protocol::consensus::MAIN_NETWORK,
+            &zcash_client_sqlite::util::SystemClock,
             &NoSapling,
             &NoSapling,
             &SpendingKeys::from_unified_spending_key(usk),

@@ -1465,6 +1465,7 @@ fn cmd_send(
     >(
         db,
         &network,
+        &zcash_client_sqlite::util::SystemClock,
         &NoSapling,
         &NoSapling,
         &SpendingKeys::from_unified_spending_key(usk),
@@ -1778,9 +1779,10 @@ mod tests {
         let encoded = usk
             .to_unified_full_viewing_key()
             .encode(&zodl_slipstream::Network::TestNetwork);
+        // librustzcash main encodes every UFVK as ZIP 316 Revision 2 ("uvf…"); decoding still accepts the R0 "uview…" form.
         assert!(
-            encoded.starts_with("uviewtest1"),
-            "testnet UFVK must carry the uviewtest HRP, got {encoded}"
+            encoded.starts_with("uvftest1"),
+            "testnet UFVK must carry the uvftest HRP, got {encoded}"
         );
     }
 

@@ -2429,6 +2429,13 @@ impl WalletWrite for SparseFacade<'_> {
         WalletWrite::prune_scan_queue_below(self.inner, height, retain_with_priority)
     }
 
+    fn queue_rescan(
+        &mut self,
+        range: Range<BlockHeight>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        WalletWrite::queue_rescan(self.inner, range)
+    }
+
     // THE INTERCEPT.
     fn put_blocks(
         &mut self,
@@ -3072,6 +3079,12 @@ impl WalletWrite for WriteBehindFacade {
         _retain_with_priority: Option<zcash_client_backend::data_api::scanning::ScanPriority>,
     ) -> Result<u64, <Self as WalletRead>::Error> {
         Err(unvirtualized("prune_scan_queue_below"))
+    }
+    fn queue_rescan(
+        &mut self,
+        _range: Range<BlockHeight>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        Err(unvirtualized("queue_rescan"))
     }
     fn put_received_transparent_utxo(
         &mut self,
@@ -4053,6 +4066,10 @@ mod write_behind_tests {
         assert!(err.to_string().contains("update_chain_tip"));
         let err = f.truncate_to_height(BlockHeight::from(5u32)).unwrap_err();
         assert!(err.to_string().contains("truncate_to_height"));
+        let err = f
+            .queue_rescan(BlockHeight::from(1u32)..BlockHeight::from(5u32))
+            .unwrap_err();
+        assert!(err.to_string().contains("queue_rescan"));
     }
 
     // ── PersistLane: serial order, depth-1 backpressure, errors, drain ─────────
@@ -4393,6 +4410,34 @@ mod flush_retained_tests {
         assert!(
             table_heights(dir.path(), "sapling_tree_retained_checkpoints").is_empty(),
             "no retained adds, no marks"
+        );
+    }
+
+    /// `queue_rescan` reaches the wallet db: the sparse facade forwards it straight to `Db`.
+    #[test]
+    fn sparse_facade_queue_rescan_reaches_the_wallet_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = fresh_db(dir.path());
+
+        let mut facade = SparseFacade {
+            inner: &mut db,
+            sparse: &mut SparseTreeState::default(),
+        };
+        WalletWrite::queue_rescan(
+            &mut facade,
+            BlockHeight::from(1_000u32)..BlockHeight::from(1_100u32),
+        )
+        .expect("queues");
+
+        let ranges = db.suggest_scan_ranges().expect("ranges");
+        assert_eq!(ranges.len(), 1, "exactly one queued range");
+        assert_eq!(
+            ranges[0].block_range(),
+            &(BlockHeight::from(1_000u32)..BlockHeight::from(1_100u32))
+        );
+        assert_eq!(
+            ranges[0].priority(),
+            zcash_client_backend::data_api::scanning::ScanPriority::Historic
         );
     }
 }
