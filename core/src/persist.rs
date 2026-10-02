@@ -33,7 +33,7 @@ use shardtree::{
     store::{Checkpoint, ShardStore},
 };
 use tracing::info;
-use transparent::address::TransparentAddress;
+use transparent::{address::TransparentAddress, bundle::OutPoint, keys::TransparentKeyScope};
 use zip32::DiversifierIndex;
 
 use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
@@ -2317,6 +2317,20 @@ impl WalletRead for SparseFacade<'_> {
     fn utxo_query_height(&self, account: Self::AccountId) -> Result<BlockHeight, Self::Error> {
         self.inner.utxo_query_height(account)
     }
+    fn get_unspent_transparent_outpoints(
+        &self,
+    ) -> Result<HashMap<OutPoint, Self::AccountId>, Self::Error> {
+        self.inner.get_unspent_transparent_outpoints()
+    }
+    #[allow(clippy::type_complexity)]
+    fn get_transparent_receiver_accounts(
+        &self,
+    ) -> Result<
+        HashMap<TransparentAddress, (Self::AccountId, Option<TransparentKeyScope>)>,
+        Self::Error,
+    > {
+        self.inner.get_transparent_receiver_accounts()
+    }
     fn transaction_data_requests(&self) -> Result<Vec<TransactionDataRequest>, Self::Error> {
         self.inner.transaction_data_requests()
     }
@@ -2574,6 +2588,21 @@ pub(crate) fn apply_nullifier_delta<A: Copy, Nf: PartialEq + Copy>(
     set.extend_from_slice(found);
 }
 
+/// Mirror of upstream `SpendIdentifiers::update_with`'s transparent half for ONE
+/// block's worth of deltas (zcash_client_backend-0.25.0-pre.0 src/scanning.rs:697-722):
+/// remove the spent outpoints, then insert the received ones. Generic so the
+/// semantics are unit-testable without `ScannedBlock` values.
+pub(crate) fn apply_outpoint_delta<K: Eq + std::hash::Hash + Clone, A: Copy>(
+    set: &mut HashMap<K, A>,
+    spent: &[K],
+    found: &[(K, A)],
+) {
+    for outpoint in spent {
+        set.remove(outpoint);
+    }
+    set.extend(found.iter().cloned());
+}
+
 fn unvirtualized(name: &str) -> SqliteClientError {
     SqliteClientError::CorruptedData(format!(
         "write-behind facade: `{name}` is not part of the scan_cached_blocks read surface \
@@ -2613,6 +2642,19 @@ fn unvirtualized(name: &str) -> SqliteClientError {
 ///    (enhancement may store full txs that add/spend notes).
 /// 4. `get_orchard_nullifiers(NullifierQuery::Unspent)` — same as (3),
 ///    scanning.rs:366.
+/// 5. `get_unspent_transparent_outpoints` — via `SpendIdentifiers::unspent`
+///    (zcash_client_backend-0.25.0-pre.0 scanning.rs:655-664). Served from a
+///    running view seeded and re-seeded like (3), advanced per stashed block by
+///    `apply_outpoint_delta` (upstream `SpendIdentifiers::update_with` semantics,
+///    scanning.rs:697-722). EXACT, as for (3).
+/// 6. `get_transparent_receiver_accounts` — chain.rs, read once per call and
+///    held fixed for the call. Served from a snapshot taken at range start and
+///    re-read at every re-seed barrier. NOT EXACT: `put_blocks` may generate new
+///    transparent gap addresses, and those of a pending (uncommitted) unit are
+///    absent from the snapshot until the next re-seed. A transparent output paying
+///    such an address is then not detected by this scan; upstream has the same
+///    limit within one call. The UTXO and transaction-data request paths still
+///    find it.
 ///
 /// Everything else a `WalletRead`/`WalletWrite` impl must provide is NOT called
 /// by `scan_cached_blocks`; each such method returns `unvirtualized` (loud
@@ -2631,6 +2673,10 @@ pub struct WriteBehindFacade {
     // [IW-6] ironwood nullifiers share the orchard domain but live in their own
     // tracking tables on main; the running view splits accordingly.
     ironwood_nfs: Vec<(DbAccountId, orchard::note::Nullifier)>,
+    /// Running view of the wallet's unspent transparent outpoints.
+    transparent_outpoints: HashMap<OutPoint, DbAccountId>,
+    /// Snapshot of the wallet's transparent receivers (see read surface item 6).
+    transparent_receivers: HashMap<TransparentAddress, (DbAccountId, Option<TransparentKeyScope>)>,
     stash: Option<PendingPersist>,
 }
 
@@ -2655,14 +2701,17 @@ impl WriteBehindFacade {
             sapling_nfs: db.get_sapling_nullifiers(NullifierQuery::Unspent)?,
             orchard_nfs: db.get_orchard_nullifiers(NullifierQuery::Unspent)?,
             ironwood_nfs: db.get_ironwood_nullifiers(NullifierQuery::Unspent)?,
+            transparent_outpoints: db.get_unspent_transparent_outpoints()?,
+            transparent_receivers: db.get_transparent_receiver_accounts()?,
             stash: None,
         })
     }
 
-    /// Re-read both running nullifier views from the committed DB. MUST be
-    /// called under a drained barrier (no stash, no in-flight commit) — used
-    /// after enhancement runs, which may store fully-decrypted transactions
-    /// that add received notes or mark notes spent outside `put_blocks`.
+    /// Re-read the running nullifier and transparent outpoint views, and the
+    /// transparent receiver snapshot, from the committed DB. MUST be called under
+    /// a drained barrier (no stash, no in-flight commit) — used after enhancement
+    /// runs, which may store fully-decrypted transactions that add received notes
+    /// or mark notes spent outside `put_blocks`.
     /// `prior_meta` and the UFVK cache are deliberately NOT re-read:
     /// enhancement never writes the `blocks` table or the accounts table.
     pub fn reseed_nullifiers(&mut self, db: &Db) -> Result<(), SqliteClientError> {
@@ -2674,6 +2723,8 @@ impl WriteBehindFacade {
         self.sapling_nfs = db.get_sapling_nullifiers(NullifierQuery::Unspent)?;
         self.orchard_nfs = db.get_orchard_nullifiers(NullifierQuery::Unspent)?;
         self.ironwood_nfs = db.get_ironwood_nullifiers(NullifierQuery::Unspent)?;
+        self.transparent_outpoints = db.get_unspent_transparent_outpoints()?;
+        self.transparent_receivers = db.get_transparent_receiver_accounts()?;
         Ok(())
     }
 
@@ -2691,6 +2742,8 @@ impl WriteBehindFacade {
             sapling_nfs: vec![],
             orchard_nfs: vec![],
             ironwood_nfs: vec![],
+            transparent_outpoints: HashMap::new(),
+            transparent_receivers: HashMap::new(),
             stash: None,
         }
     }
@@ -2881,6 +2934,20 @@ impl WalletRead for WriteBehindFacade {
     fn utxo_query_height(&self, _account: Self::AccountId) -> Result<BlockHeight, Self::Error> {
         Err(unvirtualized("utxo_query_height"))
     }
+    fn get_unspent_transparent_outpoints(
+        &self,
+    ) -> Result<HashMap<OutPoint, Self::AccountId>, Self::Error> {
+        Ok(self.transparent_outpoints.clone())
+    }
+    #[allow(clippy::type_complexity)]
+    fn get_transparent_receiver_accounts(
+        &self,
+    ) -> Result<
+        HashMap<TransparentAddress, (Self::AccountId, Option<TransparentKeyScope>)>,
+        Self::Error,
+    > {
+        Ok(self.transparent_receivers.clone())
+    }
     fn transaction_data_requests(&self) -> Result<Vec<TransactionDataRequest>, Self::Error> {
         Err(unvirtualized("transaction_data_requests"))
     }
@@ -3004,6 +3071,25 @@ impl WalletWrite for WriteBehindFacade {
                 })
                 .collect();
             apply_nullifier_delta(&mut self.ironwood_nfs, &iw_spent, &iw_found);
+
+            // The transparent outpoint view advances like upstream's
+            // `SpendIdentifiers::update_with` (scanning.rs:697-722).
+            let t_spent: Vec<OutPoint> = b
+                .transactions()
+                .iter()
+                .flat_map(|tx| tx.transparent_spends().iter().map(|s| s.outpoint().clone()))
+                .collect();
+            let t_found: Vec<(OutPoint, <Self as WalletRead>::AccountId)> = b
+                .transactions()
+                .iter()
+                .flat_map(|tx| {
+                    tx.transparent_outputs().iter().filter_map(|o| {
+                        o.recipient_account()
+                            .map(|account_id| (o.outpoint().clone(), *account_id))
+                    })
+                })
+                .collect();
+            apply_outpoint_delta(&mut self.transparent_outpoints, &t_spent, &t_found);
         }
 
         self.stash = Some(PendingPersist {
@@ -3278,7 +3364,7 @@ impl PersistLane {
             lane_conn,
             network,
             zcash_client_sqlite::util::SystemClock,
-            rand::rngs::OsRng,
+            rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         );
         let graft = if graft_buffering {
             Some(GraftCtx::open(wallet_db_path, graft_verify_sample)?)
@@ -3947,6 +4033,31 @@ mod write_behind_tests {
         assert_eq!(set, vec![(1, *b"xxxx")]);
     }
 
+    // ── apply_outpoint_delta: upstream SpendIdentifiers::update_with parity ──
+
+    /// An outpoint received in (pending) chunk N enters the view, and its spend
+    /// in chunk N+1 removes it.
+    #[test]
+    fn outpoint_found_in_pending_block_is_visible_then_spendable() {
+        let mut set: HashMap<[u8; 4], u32> = HashMap::from([(*b"aaaa", 1)]);
+        apply_outpoint_delta(&mut set, &[], &[(*b"utxo", 7)]);
+        assert_eq!(set, HashMap::from([(*b"aaaa", 1), (*b"utxo", 7)]));
+        apply_outpoint_delta(&mut set, &[*b"utxo", *b"aaaa"], &[]);
+        assert!(
+            set.is_empty(),
+            "spent outpoints must leave the unspent view"
+        );
+    }
+
+    /// Per-block ordering parity: removal happens BEFORE insertion within one
+    /// block, as in upstream's update_with.
+    #[test]
+    fn outpoint_delta_is_remove_then_insert_per_block() {
+        let mut set: HashMap<[u8; 4], u32> = HashMap::from([(*b"xxxx", 1)]);
+        apply_outpoint_delta(&mut set, &[*b"xxxx"], &[(*b"xxxx", 2)]);
+        assert_eq!(set, HashMap::from([(*b"xxxx", 2)]));
+    }
+
     // ── WriteBehindFacade virtualized reads ────────────────────────────────────
 
     fn test_meta(height: u32) -> BlockMetadata {
@@ -4352,7 +4463,7 @@ mod flush_retained_tests {
         rusqlite::Connection,
         crate::network::SlipstreamNetwork,
         SystemClock,
-        rand::rngs::OsRng,
+        rand::rand_core::UnwrapErr<rand::rngs::SysRng>,
     > {
         let conn = rusqlite::Connection::open(dir.join("wallet.sqlite")).expect("opens");
         rusqlite::vtab::array::load_module(&conn).expect("array vtab");
@@ -4360,7 +4471,7 @@ mod flush_retained_tests {
             conn,
             crate::network::SlipstreamNetwork::MAIN,
             SystemClock,
-            rand::rngs::OsRng,
+            rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         );
         init_wallet_db(&mut db, None).expect("initializes the wallet schema");
         db

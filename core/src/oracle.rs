@@ -148,16 +148,20 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, Slipstre
 
 /// Multiset of canonicalized rows for one table.
 /// v0.6 P4b: tables whose row RESIDUE depends on put_blocks call cadence, not
-/// wallet semantics. `prune_tracked_nullifiers` anchors on the fully-scanned
+/// wallet semantics. `prune_tracked_spends` anchors on the fully-scanned
 /// frontier at each call, so even two UPSTREAM syncs with different chunk sizes
 /// disagree on which below-window rows linger. The contract compared here is
 /// therefore WINDOWED: both sides are normalized to rows at or above
-/// `max(block_height across A∪B) − NULLIFIER_MAP_RETENTION_BLOCKS` — everything
+/// `max(block_height across A∪B) − SPEND_MAP_RETENTION_BLOCKS` — everything
 /// any read (`detect_*_spend`, `ext_slipstream_v_tx_reconciled`) can ever consult —
 /// and STRICT equality is required inside that window. The skip-below-window
 /// tracking lives INSIDE upstream `put_blocks_rows` since #2604, keyed on the
 /// same public retention constant used here.
-const TRANSIENT_WINDOW_TABLES: &[&str] = &["nullifier_map", "tx_locator_map"];
+const TRANSIENT_WINDOW_TABLES: &[&str] = &[
+    "nullifier_map",
+    "tx_locator_map",
+    "transparent_spend_locator_map",
+];
 
 fn transient_window_floor(
     a: &Connection,
@@ -173,7 +177,7 @@ fn transient_window_floor(
         .map_err(|e| wallet_err("max height", e))
     };
     Ok(max_of(a)?.max(max_of(b)?).map(|h| {
-        h.saturating_sub(zcash_client_backend::data_api::ll::wallet::NULLIFIER_MAP_RETENTION_BLOCKS)
+        h.saturating_sub(zcash_client_backend::data_api::ll::wallet::SPEND_MAP_RETENTION_BLOCKS)
     }))
 }
 
@@ -1894,7 +1898,7 @@ mod tests {
             ) -> Option<sapling::circuit::Spend> {
                 unreachable!("orchard-only tx must not prepare sapling spends")
             }
-            fn create_proof<R: rand::RngCore>(
+            fn create_proof<R: rand::Rng>(
                 &self,
                 _: sapling::circuit::Spend,
                 _: &mut R,
@@ -1916,7 +1920,7 @@ mod tests {
             ) -> sapling::circuit::Output {
                 unreachable!("orchard-only tx must not prepare sapling outputs")
             }
-            fn create_proof<R: rand::RngCore>(
+            fn create_proof<R: rand::Rng>(
                 &self,
                 _: sapling::circuit::Output,
                 _: &mut R,
@@ -1943,6 +1947,7 @@ mod tests {
             db,
             &zcash_protocol::consensus::MAIN_NETWORK,
             &zcash_client_sqlite::util::SystemClock,
+            &mut rand::rand_core::UnwrapErr(rand::rngs::SysRng),
             &NoSapling,
             &NoSapling,
             &SpendingKeys::from_unified_spending_key(usk),
