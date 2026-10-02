@@ -711,7 +711,7 @@ fn cmd_watch(
                     &db_path,
                     network,
                     zcash_client_sqlite::util::SystemClock,
-                    rand::rngs::OsRng,
+                    rand::rand_core::UnwrapErr(rand::rngs::SysRng),
                 ) {
                     Ok(db) => match db.get_wallet_summary(
                         zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default(),
@@ -1420,11 +1420,7 @@ fn cmd_send(
         ) -> Option<sapling::circuit::Spend> {
             unreachable!("orchard/ironwood-only tx must not prepare sapling spends")
         }
-        fn create_proof<R: rand::RngCore>(
-            &self,
-            _: sapling::circuit::Spend,
-            _: &mut R,
-        ) -> Self::Proof {
+        fn create_proof<R: rand::Rng>(&self, _: sapling::circuit::Spend, _: &mut R) -> Self::Proof {
             unreachable!("orchard/ironwood-only tx must not prove sapling spends")
         }
         fn encode_proof(_: Self::Proof) -> sapling::bundle::GrothProofBytes {
@@ -1442,7 +1438,7 @@ fn cmd_send(
         ) -> sapling::circuit::Output {
             unreachable!("orchard/ironwood-only tx must not prepare sapling outputs")
         }
-        fn create_proof<R: rand::RngCore>(
+        fn create_proof<R: rand::Rng>(
             &self,
             _: sapling::circuit::Output,
             _: &mut R,
@@ -1465,6 +1461,8 @@ fn cmd_send(
     >(
         db,
         &network,
+        &zcash_client_sqlite::util::SystemClock,
+        &mut rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         &NoSapling,
         &NoSapling,
         &SpendingKeys::from_unified_spending_key(usk),
@@ -1778,9 +1776,10 @@ mod tests {
         let encoded = usk
             .to_unified_full_viewing_key()
             .encode(&zodl_slipstream::Network::TestNetwork);
+        // librustzcash main encodes every UFVK as ZIP 316 Revision 2 ("uvf…"); decoding still accepts the R0 "uview…" form.
         assert!(
-            encoded.starts_with("uviewtest1"),
-            "testnet UFVK must carry the uviewtest HRP, got {encoded}"
+            encoded.starts_with("uvftest1"),
+            "testnet UFVK must carry the uvftest HRP, got {encoded}"
         );
     }
 

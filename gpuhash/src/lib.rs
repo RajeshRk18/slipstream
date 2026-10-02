@@ -294,7 +294,7 @@ mod tests {
     use super::*;
     use incrementalmerkletree::{Hashable, Level};
     use orchard::tree::MerkleHashOrchard;
-    use rand::{RngCore, SeedableRng, rngs::StdRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
 
     /// Whether a wgpu adapter can be acquired. The GPU test skips (rather than
     /// panicking in `Gpu::new`) where there is none — e.g. a GPU-less CI runner.
