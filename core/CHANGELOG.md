@@ -21,6 +21,8 @@ workspace.
   `zcash_keys 0.17.0-pre.0`, `zcash_primitives 0.31.0-pre.0`,
   `zcash_protocol 0.11.0-pre.0`, `zcash_transparent 0.11.0-pre.0`, and
   `zip32 0.3`.
+- The `gpu` feature requires `zodl-slipstream-gpuhash` 0.1.2, which is built on
+  the same curve generation.
 - Unified full viewing keys are encoded as ZIP 316 Revision 2 (`uvf…` on
   mainnet, `uvftest…` on testnet), so encodings stored by a host differ from
   those this crate now produces.

@@ -17,7 +17,7 @@ categories = ["cryptography::cryptocurrencies"]
 
 [workspace.dependencies]
 # Intra-workspace dependencies
-slipstream-gpuhash = { package = "zodl-slipstream-gpuhash", version = "0.1", path = "gpuhash" }
+slipstream-gpuhash = { package = "zodl-slipstream-gpuhash", version = "0.1.2", path = "gpuhash" }
 
 # Slipstream shared versions (P0-review carry-over). Root package keeps its own
 # [dependencies] block; slipstream crates inherit from here.
