@@ -8,6 +8,8 @@ indicated by the `PLANNED` status in order to make it possible to correctly
 represent the transitive `semver` implications of changes within the enclosing
 workspace.
 
+## [Unreleased]
+
 ## [0.4.0-pre.0] - 2026-10-05
 
 ### Added
@@ -23,9 +25,10 @@ workspace.
   `zip32 0.3`.
 - The `gpu` feature requires `zodl-slipstream-gpuhash` 0.1.2, which is built on
   the same curve generation.
-- Unified full viewing keys are encoded as ZIP 316 Revision 2 (`uvf…` on
-  mainnet, `uvftest…` on testnet), so encodings stored by a host differ from
-  those this crate now produces.
+- Unified addresses and unified full viewing keys are encoded as ZIP 316
+  Revision 2: addresses as `zu…`, without their transparent receiver, and
+  UFVKs as `uvf…` on mainnet (`uvftest…` on testnet). Encodings stored by a
+  host differ from those this crate now produces.
 
 ## [0.3.0] - 2026-10-01
 
