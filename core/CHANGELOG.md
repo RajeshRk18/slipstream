@@ -26,9 +26,12 @@ workspace.
 - The `gpu` feature requires `zodl-slipstream-gpuhash` 0.1.2, which is built on
   the same curve generation.
 - Unified addresses and unified full viewing keys are encoded as ZIP 316
-  Revision 2: addresses as `zu…`, without their transparent receiver, and
-  UFVKs as `uvf…` on mainnet (`uvftest…` on testnet). Encodings stored by a
-  host differ from those this crate now produces.
+  Revision 2: an address as `zu…` when it has no transparent receiver and as
+  `tu…` when it has one (its receivers come from the host's
+  `UnifiedAddressRequest`), and a UFVK as `uvf…`; on testnet, as `zutest…`,
+  `tutest…` and `uvftest…`. Encodings stored by a host differ from those this
+  crate now produces.
+- `engine::ENGINE_BUILD` is `2026-10-05.v0.13-nu7-pre-release-crates`.
 
 ## [0.3.0] - 2026-10-01
 
