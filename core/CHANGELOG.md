@@ -8,7 +8,11 @@ indicated by the `PLANNED` status in order to make it possible to correctly
 represent the transitive `semver` implications of changes within the enclosing
 workspace.
 
-## [Unreleased]
+## [0.4.0-pre.0] - 2026-10-05
+
+### Added
+- `persist::SparseFacade` and `persist::WriteBehindFacade` implement
+  `WalletWrite::queue_rescan`, which `zcash_client_backend` 0.25 adds.
 
 ### Changed
 - Migrated to `incrementalmerkletree 0.9`, `orchard 0.16`, `rand 0.10`,
