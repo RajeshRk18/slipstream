@@ -10,6 +10,12 @@ workspace.
 
 ## [Unreleased]
 
+## [0.4.0-pre.0] - 2026-10-05
+
+### Added
+- `persist::SparseFacade` and `persist::WriteBehindFacade` implement
+  `WalletWrite::queue_rescan`, which `zcash_client_backend` 0.25 adds.
+
 ### Changed
 - Migrated to `incrementalmerkletree 0.9`, `orchard 0.16`, `rand 0.10`,
   `sapling-crypto 0.9`, `shardtree 0.8`, `zcash_address 0.14.0-pre.0`,
@@ -17,9 +23,12 @@ workspace.
   `zcash_keys 0.17.0-pre.0`, `zcash_primitives 0.31.0-pre.0`,
   `zcash_protocol 0.11.0-pre.0`, `zcash_transparent 0.11.0-pre.0`, and
   `zip32 0.3`.
-- Unified full viewing keys are encoded as ZIP 316 Revision 2 (`uvf…` on
-  mainnet, `uvftest…` on testnet), so encodings stored by a host differ from
-  those this crate now produces.
+- The `gpu` feature requires `zodl-slipstream-gpuhash` 0.1.2, which is built on
+  the same curve generation.
+- Unified addresses and unified full viewing keys are encoded as ZIP 316
+  Revision 2: addresses as `zu…`, without their transparent receiver, and
+  UFVKs as `uvf…` on mainnet (`uvftest…` on testnet). Encodings stored by a
+  host differ from those this crate now produces.
 
 ## [0.3.0] - 2026-10-01
 
